@@ -1,4 +1,5 @@
-"""The gateway against a fake proxy: JSON links come back on the gateway's own address, streams pass through.
+"""The gateway against a fake proxy: JSON links come back on the gateway's own address, streams pass through,
+/ping says when ComfyUI is up.
 
     pip install aiohttp && python test/gateway_test.py
 """
@@ -7,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "infra"))
 os.environ["FREEFIELD_TOKEN"] = "t0k"
 os.environ["PROXY_URL"] = "http://127.0.0.1:18189"
+os.environ["COMFYUI_URL"] = "http://127.0.0.1:18188"
 from aiohttp import web, ClientSession
 import gateway  # infra/gateway.py
 
@@ -48,7 +50,31 @@ async def main():
         assert "http://127.0.0.1:18189/x" in text, "streams are passed through untouched"
         async with s.get("http://127.0.0.1:18000/api/v2/jobs/j1") as r:
             assert r.status == 401, r.status
-    print("gateway relink ok")
-    await gw.cleanup(); await proxy.cleanup()
+        # behind a load balancer that hands the worker its own Host, FREEFIELD_PUBLIC_URL writes the links
+        gateway.PUBLIC_URL = "https://ep1.api.runpod.ai"
+        async with s.get("http://127.0.0.1:18000/api/v2/jobs/j1", headers={**h, "Host": "10.0.3.7:80"}) as r:
+            body = await r.json()
+        assert body["urls"]["self"] == "https://ep1.api.runpod.ai/api/v2/jobs/j1", body["urls"]
+        gateway.PUBLIC_URL = ""
+        # open (RunPod's API key is the lock): any bearer, or none, goes through
+        gateway.ALLOW_OPEN = True
+        async with s.get("http://127.0.0.1:18000/api/v2/jobs/j1", headers={"Authorization": "Bearer rpa_other"}) as r:
+            assert r.status == 200, r.status
+        gateway.ALLOW_OPEN = False
+        # /ping, open: 204 while ComfyUI does not answer, 200 once it and the proxy do
+        async with s.get("http://127.0.0.1:18000/ping") as r:
+            assert r.status == 204, r.status
+        async def system_stats(_):
+            return web.json_response({"devices": []})
+        comfy = web.Application(); comfy.router.add_get("/system_stats", system_stats)
+        comfy_runner = web.AppRunner(comfy); await comfy_runner.setup(); await web.TCPSite(comfy_runner, "127.0.0.1", 18188).start()
+        async with s.get("http://127.0.0.1:18000/ping") as r:
+            assert r.status == 200, r.status
+        await proxy.cleanup()
+        async with s.get("http://127.0.0.1:18000/ping") as r:
+            assert r.status == 204, f"{r.status}: the proxy is down, so not ready"
+        await comfy_runner.cleanup()
+    print("gateway relink and ping ok")
+    await gw.cleanup()
 
 asyncio.run(main())

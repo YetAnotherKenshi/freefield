@@ -191,7 +191,23 @@ export type RunnerOptions = {
   /** Let draft apps run too (default: FREEFIELD_DRAFTS=1). Drafts have a workflow nobody has run on a GPU yet. */
   allowDrafts?: boolean;
   fetch?: typeof fetch;
+  /** How long a cold start may take before giving up on it (default 15 min); see `stillStarting`. */
+  coldStartMs?: number;
+  /** The pause between two tries while the backend is starting (default 5 s, as RunPod advises). */
+  retryDelayMs?: number;
 };
+
+/**
+ * Answers that mean the backend is still starting and the same request should be sent again. RunPod's load balancer
+ * holds a request for 2 minutes while no worker is ready, then answers {"error":"no workers available"}; a proxy in
+ * front of a server that is booting answers 502, 503 or 504 (524 from Cloudflare), and an overloaded one 429.
+ * Modal holds the request until its container is up, so it never sends these on a cold start.
+ */
+export async function stillStarting(res: Response): Promise<boolean> {
+  if (res.ok) return false;
+  if ([429, 502, 503, 504, 524].includes(res.status)) return true;
+  return /no workers available/i.test(await res.clone().text().catch(() => ""));
+}
 
 export class Runner {
   readonly baseUrl: string;
@@ -199,6 +215,8 @@ export class Runner {
   readonly allowDrafts: boolean;
   private comfy: Comfy;
   private doFetch: typeof fetch;
+  private coldStartMs: number;
+  private retryDelayMs: number;
 
   constructor(opts: RunnerOptions = {}) {
     this.baseUrl = (opts.baseUrl ?? process.env.COMFY_BASE_URL ?? "").replace(/\/$/, "");
@@ -207,22 +225,55 @@ export class Runner {
     this.allowDrafts = opts.allowDrafts ?? process.env.FREEFIELD_DRAFTS === "1";
     process.env.COMFY_BASE_URL = this.baseUrl; // the SDK reads its base URL from the environment
     this.doFetch = opts.fetch ?? fetch;
+    this.coldStartMs = opts.coldStartMs ?? 15 * 60 * 1000;
+    this.retryDelayMs = opts.retryDelayMs ?? 5000;
     this.comfy = new Comfy({ apiKey: this.token, clientInfo: "freefield", fetch: opts.fetch });
+  }
+
+  private auth(): Record<string, string> {
+    return this.token ? { authorization: `Bearer ${this.token}` } : {};
+  }
+
+  /**
+   * fetch, sent again while the answer says the backend is still starting, for up to coldStartMs. A refused
+   * connection is not a cold start (nothing listens: a local backend that is not running) and fails at once.
+   */
+  private async fetchThroughColdStart(url: string, init: RequestInit = {}): Promise<Response> {
+    const deadline = Date.now() + this.coldStartMs;
+    let told = false;
+    for (;;) {
+      const res = await this.doFetch(url, init);
+      if (!(await stillStarting(res)) || Date.now() + this.retryDelayMs >= deadline) return res;
+      if (!told) {
+        console.error(`the backend is starting (HTTP ${res.status}); asking again for up to ${Math.round(this.coldStartMs / 60_000)} min`);
+        told = true;
+      }
+      await res.body?.cancel().catch(() => {});
+      await new Promise((r) => setTimeout(r, this.retryDelayMs));
+    }
+  }
+
+  /**
+   * Start the backend if it is cold and wait until it answers /health. The token goes along although the gateway
+   * does not ask for it there: RunPod's endpoint wants its API key on every request.
+   */
+  async health(): Promise<void> {
+    const res = await this.fetchThroughColdStart(`${this.baseUrl}/health`,
+      { headers: this.auth(), signal: AbortSignal.timeout(this.coldStartMs) });
+    if (!res.ok) throw new Error(`/health answered ${res.status}`);
   }
 
   /**
    * Ask the gateway to make room for this app. It compares the model set with the one
    * loaded last and unloads everything from VRAM when they differ. A backend without the
    * Freefield gateway (a bare comfy-api-proxy, a hosted Comfy API) answers 404 and manages
-   * its own memory, so that is not an error.
+   * its own memory, so that is not an error. It is the first request of every run, so it is the one that waits
+   * out a cold start; the job's own requests then find the backend up.
    */
   async prepare(app: App): Promise<{ freed: boolean; skipped?: boolean }> {
-    const res = await this.doFetch(`${this.baseUrl}/freefield/prepare`, {
+    const res = await this.fetchThroughColdStart(`${this.baseUrl}/freefield/prepare`, {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        ...(this.token ? { authorization: `Bearer ${this.token}` } : {}),
-      },
+      headers: { "content-type": "application/json", ...this.auth() },
       body: JSON.stringify({ app: app.id, models: modelKey(app) }),
     });
     if (res.status === 404 || res.status === 405) return { freed: false, skipped: true };
@@ -260,7 +311,7 @@ export class Runner {
    */
   async *frames(jobId: string, signal: AbortSignal): AsyncIterable<Frame> {
     const url = `${this.baseUrl}/api/v2/jobs/${encodeURIComponent(jobId)}/events`;
-    const headers = { accept: "text/event-stream", ...(this.token ? { authorization: `Bearer ${this.token}` } : {}) };
+    const headers = { accept: "text/event-stream", ...this.auth() };
     let failures = 0;
     while (!signal.aborted) {
       let res: Response;

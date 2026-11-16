@@ -7,9 +7,9 @@ Open-source Higgsfield on ComfyUI: every app is one folder, every model is open 
 ![The web app: the Video menu, Cinema Studio Video with the lab's example loaded and its camera moves, then the result playing in the Library tab](docs/media/ui-demo.webp)
 
 Image, video, VFX and audio apps in a studio laid out like Higgsfield's, each one a ComfyUI workflow on open weights,
-run on Modal or on your own ComfyUI. Every example in the app is a real GPU run made by the lab, with its time and peak VRAM.
+run on Modal, on RunPod or on your own ComfyUI. Every example in the app is a real GPU run made by the lab, with its time and peak VRAM.
 
-[Run it](#run-it) on Modal or [on your own GPU](#on-your-own-gpu-without-modal) · [every app](#apps) with its model and VRAM · [add an app](#add-an-app) from any ComfyUI workflow ·
+[Run it](#run-it) on Modal, [on RunPod](#on-runpod) or [on your own GPU](#on-your-own-gpu-without-modal) · [every app](#apps) with its model and VRAM · [add an app](#add-an-app) from any ComfyUI workflow ·
 [every GPU run](docs/lab-runs.md) of the lab
 
 <table>
@@ -30,7 +30,7 @@ format; the web UI, the runner, the model downloads, the VRAM map and the tests 
 ```
 browser ──▶ web/ + server/ (Node, Comfy SDK) ──▶ gateway :8000 ──▶ comfy-api-proxy :8189 ──▶ ComfyUI :8188
              menu and forms drawn                 token check,          Comfy API v2              your GPU
-             from apps/*/app.json                 unloads the GPU       in front of ComfyUI       (Modal or local)
+             from apps/*/app.json                 unloads the GPU       in front of ComfyUI       (Modal, RunPod or local)
                                                   when the app changes
 ```
 
@@ -218,7 +218,8 @@ models the gateway calls ComfyUI's `POST /free`, so nothing from the previous ap
 
 ## Run it
 
-You need Node 22.6+, Python 3.10+ and a [Modal](https://modal.com) account, or a GPU of your own ([below](#on-your-own-gpu-without-modal)).
+You need Node 22.6+, Python 3.10+ and a [Modal](https://modal.com) account, a [RunPod](https://www.runpod.io) account
+([below](#on-runpod)) or a GPU of your own ([below](#on-your-own-gpu-without-modal)).
 
 ```sh
 # 0. what is missing: Node, Modal login and secrets, Hugging Face license access per model, .env
@@ -271,6 +272,83 @@ Models go to `<dir>/models`; `--models` points at a model folder you already hav
 the *On a 24 GB card* column of [the app table](#apps) and the [VRAM map](docs/vram-map.md). Checked on 27 Oct on a
 CPU-only machine, setup to a finished run of the model-free `smoke` app through the gateway; the GPU apps send the
 same workflows as on Modal.
+
+### On RunPod
+
+The same backend runs on RunPod in two ways: on a **Pod** you start and stop yourself, or on a **Serverless** endpoint
+that starts a worker on the first request and stops it when idle, as Modal does.
+
+**On a Pod**, `tools/local_backend.py` runs as on your own GPU. Make a network volume, then a Pod from RunPod's PyTorch
+template with that volume (it mounts at `/workspace`), HTTP port 8000 exposed, and `FREEFIELD_TOKEN` (the one in your
+`.env`) and `HF_TOKEN` as environment variables. In the Pod's terminal:
+
+```sh
+cd /workspace && git clone https://github.com/neuregex/freefield.git
+python -m venv --system-site-packages /workspace/venv     # torch from the image; what setup installs stays on the volume
+/workspace/venv/bin/python freefield/tools/local_backend.py setup /workspace/comfy
+/workspace/venv/bin/python freefield/tools/local_backend.py download /workspace/comfy image-flux3
+/workspace/venv/bin/python freefield/tools/local_backend.py serve /workspace/comfy   # after a restart, only this line
+```
+
+Then `COMFY_BASE_URL=https://<POD_ID>-8000.proxy.runpod.net` in `.env`. Stopping the Pod wipes its container disk
+but not `/workspace`. RunPod's proxy closes a request it has not answered in 100 s; the web app's event stream
+reconnects. A TCP port (`http://<ip>:<port>`) does not work, because the gateway writes the links in its answers as
+https for any public address; an SSH tunnel does (`ssh -L 8000:127.0.0.1:8000 …`, then
+`COMFY_BASE_URL=http://127.0.0.1:8000`).
+
+**Serverless** uses a load-balancing endpoint, which sends HTTP requests straight to a worker. The worker image is
+`Dockerfile.runpod`: the same ComfyUI, custom nodes and comfy-api-proxy as Modal's image, with
+`infra/runpod_worker.py` as its command.
+
+```sh
+# 1. the image (or let RunPod build it from a GitHub repo of yours: Dockerfile Path Dockerfile.runpod; a new release rebuilds it)
+docker build --platform linux/amd64 -f Dockerfile.runpod -t <you>/freefield-worker .
+docker push <you>/freefield-worker
+
+# 2. the models, onto a network volume, from any Pod (a CPU one is enough) with the volume attached and HF_TOKEN set
+cd /workspace && pip install "huggingface_hub[hf-xet]" && git clone https://github.com/neuregex/freefield.git
+python freefield/tools/local_backend.py download /workspace/comfy image-flux3 video-ltx25 --models /workspace/models
+```
+
+A Pod mounts the volume at `/workspace` and a worker at `/runpod-volume`, so the worker finds the models in
+`/runpod-volume/models`. Then make the endpoint (**New Endpoint**, type **Load Balancer**) from the image, with:
+
+| Setting | Value | Why |
+|---|---|---|
+| GPU | 48 GB (L40S, A6000, RTX 6000 Ada) for the apps marked *needs Modal*, 24 GB for the rest | the [app table](#apps) |
+| CUDA versions | 13.0 and up | the image's torch 2.14.1 is built for CUDA 13.0 |
+| Max workers | 1 | the jobs live in one ComfyUI, as `max_containers=1` does on Modal |
+| Active workers | 0 | scales to zero |
+| Idle timeout | 600 s | the web app counts on 10 warm minutes after a run, as on Modal; less is cheaper |
+| Network volume | the one with the models | |
+| `PORT`, `PORT_HEALTH` | leave both at 80 | the gateway answers RunPod's `/ping` health check on its own port |
+
+In `.env`:
+
+```sh
+COMFY_BASE_URL=https://<ENDPOINT_ID>.api.runpod.ai
+FREEFIELD_TOKEN=<a RunPod API key>    # Restricted, with access to this endpoint only
+FREEFIELD_MAX_UPLOAD_MB=28            # RunPod takes at most 30 MB per request
+```
+
+RunPod's endpoint wants its API key in the `Authorization` header, the one the gateway reads its own token from, so
+the worker's gateway runs open and the RunPod key is the lock. RunPod's documented limits, and what Freefield does
+about them:
+
+- A request and a response can carry 30 MB. `FREEFIELD_MAX_UPLOAD_MB` makes the web app refuse bigger inputs up front.
+  An output larger than that (a long or upscaled video) may not come back: run those on a Pod.
+- A request may take 5.5 minutes. Only the job's event stream lasts longer, and it reconnects.
+- With no worker up, a request waits 2 minutes, then gets "no workers available". The first request of a run and the
+  GPU pill's wake ask again every 5 s for up to 15 minutes, so a cold start (image pull, then ComfyUI boot) gets
+  through.
+- When links in job answers come out wrong (`fetch failed` after the submit), set `FREEFIELD_PUBLIC_URL` to the
+  endpoint URL in the endpoint's environment. The worker sets it from `RUNPOD_ENDPOINT_ID` when RunPod provides that.
+
+Checked on 16 Nov without a RunPod account, on a Mac: `infra/runpod_worker.py` over a CPU ComfyUI installed the way
+the image installs it (torch 2.14.1, then `local_backend.py setup`) answered `/ping` with 204 while ComfyUI booted
+and 200 after, ran the model-free `smoke` app from `npm run app` with a made-up RunPod key as the token, woke from the
+GPU pill, and stopped all three processes on SIGTERM. The image itself was not built here, and nothing has run on
+RunPod yet.
 
 ### The web app
 

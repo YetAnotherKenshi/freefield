@@ -9,12 +9,15 @@
   unload everything (POST /free) so nothing from the previous app stays in VRAM.
 - GET /freefield/status shows the current app and ComfyUI's device stats.
 - GET /health is open, for Modal's startup probe.
+- GET /ping is open too, for load balancers that route only to ready workers (RunPod
+  Serverless): 204 while ComfyUI or comfy-api-proxy is still starting, 200 once both answer.
 - The proxy writes absolute links (a job's `urls.self`, `.events`, `.cancel`, an output's
   `url`) from the host *it* sees, http://127.0.0.1:8189; the SDK follows those links
   verbatim, so from outside they went nowhere ("fetch failed", 23 oct). JSON answers are
-  rewritten to the address the client reached the gateway on.
+  rewritten to the address the client reached the gateway on, or to FREEFIELD_PUBLIC_URL
+  when that is set (behind a load balancer whose Host header is not the public one).
 
-Run: python gateway.py  (env: FREEFIELD_TOKEN, COMFYUI_URL, PROXY_URL, GATEWAY_PORT)
+Run: python gateway.py  (env: FREEFIELD_TOKEN, COMFYUI_URL, PROXY_URL, GATEWAY_PORT, FREEFIELD_PUBLIC_URL)
 """
 from __future__ import annotations
 
@@ -30,6 +33,8 @@ COMFYUI_URL = os.environ.get("COMFYUI_URL", "http://127.0.0.1:8188")
 PROXY_URL = os.environ.get("PROXY_URL", "http://127.0.0.1:8189")
 TOKEN = os.environ.get("FREEFIELD_TOKEN", "")
 ALLOW_OPEN = os.environ.get("FREEFIELD_ALLOW_OPEN") == "1"
+PUBLIC_URL = os.environ.get("FREEFIELD_PUBLIC_URL", "").strip().rstrip("/")
+OPEN_PATHS = {"/health", "/ping"}
 HOP_HEADERS = {"host", "authorization", "content-length", "transfer-encoding", "connection", "keep-alive"}
 
 log = logging.getLogger("gateway")
@@ -67,12 +72,29 @@ def authorized(request: web.Request) -> bool:
 
 @web.middleware
 async def auth_mw(request: web.Request, handler):
-    if request.path == "/health" or authorized(request):
+    if request.path in OPEN_PATHS or authorized(request):
         return await handler(request)
     return web.json_response({"error": "missing or wrong token"}, status=401)
 
 
 async def health(_: web.Request) -> web.Response:
+    return web.json_response({"ok": True})
+
+
+async def ping(request: web.Request) -> web.Response:
+    """200 once ComfyUI and comfy-api-proxy both answer, 204 while either is still starting.
+    The gateway starts first on RunPod (infra/runpod_worker.py), so the health check sees a
+    worker that is booting, not one that is gone."""
+    session: ClientSession = request.app["session"]
+    quick = ClientTimeout(total=3)
+    try:
+        async with session.get(f"{COMFYUI_URL}/system_stats", timeout=quick) as r:
+            if r.status != 200:
+                return web.Response(status=204)
+        async with session.get(f"{PROXY_URL}/", timeout=quick):
+            pass   # any answer, a 404 included: it is listening
+    except Exception:
+        return web.Response(status=204)
     return web.json_response({"ok": True})
 
 
@@ -103,7 +125,10 @@ def external_base(request: web.Request) -> str:
     """Where the client reached us. Modal terminates TLS and talks plain http to the container
     without an X-Forwarded-Proto header (first deploy, 23 oct: links came out as http://…modal.run,
     the SDK saw another origin and sent no token, 401), so a public host is https unless a proxy
-    says otherwise; only a local or private address keeps the scheme it was reached on."""
+    says otherwise; only a local or private address keeps the scheme it was reached on.
+    FREEFIELD_PUBLIC_URL, when set, wins: a load balancer may hand the worker a Host of its own."""
+    if PUBLIC_URL:
+        return PUBLIC_URL
     forwarded = request.headers.get("X-Forwarded-Proto", "").split(",")[0].strip()
     host = request.host
     name = host.rsplit(":", 1)[0] if not host.startswith("[") else host.split("]")[0] + "]"
@@ -157,6 +182,7 @@ def make_app() -> web.Application:
         raise SystemExit("FREEFIELD_TOKEN is not set; refusing to start an open gateway")
     app = web.Application(middlewares=[auth_mw], client_max_size=1024 ** 3)
     app.router.add_get("/health", health)
+    app.router.add_get("/ping", ping)
     app.router.add_post("/freefield/prepare", prepare)
     app.router.add_get("/freefield/status", status)
     app.router.add_route("*", "/{tail:.*}", forward)

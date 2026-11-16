@@ -148,25 +148,41 @@ def check_hf(packs: list[str], with_lab: bool) -> None:
             report(WARN, f"{where}: could not check {repo} (HTTP {status})")
 
 
+def env_values() -> dict[str, str]:
+    env = ROOT / ".env"
+    text = env.read_text(encoding="utf-8") if env.exists() else ""
+    return dict(re.findall(r"^\s*([A-Z_]+)\s*=\s*(.*?)\s*$", text, flags=re.M))
+
+
+def on_runpod(base: str) -> bool:
+    return ".runpod.ai" in base or ".runpod.net" in base
+
+
 def check_env() -> None:
     env = ROOT / ".env"
     if not env.exists():
         report(BAD, ".env missing (the web app reads COMFY_BASE_URL and FREEFIELD_TOKEN from it)",
                "python tools/setup_token.py   (creates .env with the same token as the Modal secret)")
         return
-    values = dict(re.findall(r"^\s*([A-Z_]+)\s*=\s*(.*?)\s*$", env.read_text(encoding="utf-8"), flags=re.M))
+    values = env_values()
     base, token = values.get("COMFY_BASE_URL", ""), values.get("FREEFIELD_TOKEN", "")
     if not base or "YOUR-WORKSPACE" in base:
         report(BAD, "COMFY_BASE_URL not set in .env", "paste the URL printed by: modal deploy infra/modal_app.py")
         return
+    serverless = ".api.runpod.ai" in base
     if not token:
-        report(BAD, "FREEFIELD_TOKEN empty in .env", "python tools/setup_token.py   (writes one token to .env and the Modal secret)")
-    try:
-        with urllib.request.urlopen(f"{base.rstrip('/')}/health", timeout=20) as r:
+        report(BAD, "FREEFIELD_TOKEN empty in .env",
+               "put your RunPod API key there" if serverless else
+               "python tools/setup_token.py   (writes one token to .env and the Modal secret)")
+    try:   # the token goes along: RunPod's endpoint refuses any request without its API key, /health included
+        req = urllib.request.Request(f"{base.rstrip('/')}/health",
+                                     headers={"authorization": f"Bearer {token}"} if token else {})
+        with urllib.request.urlopen(req, timeout=20) as r:
             report(OK, f"backend answers at {base} (HTTP {r.status})")
     except Exception as e:  # a cold Modal container can take a while; this is only a hint
         report(WARN, f"backend at {base} did not answer /health ({type(e).__name__})",
-               "deploy it (modal deploy infra/modal_app.py) or wait for a cold start and retry")
+               "a cold RunPod worker can take minutes (the endpoint answers \"no workers available\" meanwhile): retry"
+               if serverless else "deploy it (modal deploy infra/modal_app.py) or wait for a cold start and retry")
         return
     if token:
         req = urllib.request.Request(f"{base.rstrip('/')}/freefield/status", headers={"authorization": f"Bearer {token}"})
@@ -175,6 +191,7 @@ def check_env() -> None:
                 report(OK, f"gateway accepts the token (HTTP {r.status})")
         except urllib.error.HTTPError as e:
             report(BAD, f"gateway refused the token (HTTP {e.code})",
+                   "FREEFIELD_TOKEN in .env must be a RunPod API key with access to this endpoint" if serverless else
                    "python tools/setup_token.py, then modal deploy infra/modal_app.py so the backend gets the new token")
         except Exception as e:
             report(WARN, f"could not reach /freefield/status ({type(e).__name__})")
@@ -194,6 +211,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"unknown pack(s): {', '.join(sorted(unknown))}; known: {', '.join(all_packs)}", file=sys.stderr)
         return 2
     skip = set(a.skip.split(","))
+    base = os.environ.get("COMFY_BASE_URL") or env_values().get("COMFY_BASE_URL", "")
+    if "modal" not in skip and (on_runpod(base) or base.startswith(("http://127.0.0.1", "http://localhost"))):
+        skip.add("modal")
+        print(f"backend at {base} is not on Modal: the Modal CLI and its secrets are not needed")
     with_lab = not a.pack   # a full check also covers the LoRAs the lab downloads
     for name, fn in [("node", check_node), ("modal", check_modal), ("hf", lambda: check_hf(packs, with_lab)), ("env", check_env)]:
         if name not in skip:

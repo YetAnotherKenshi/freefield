@@ -1,0 +1,35 @@
+# Freefield's backend as a RunPod Serverless worker (a load-balancing endpoint); infra/runpod_worker.py is its command.
+#
+#   docker build --platform linux/amd64 -f Dockerfile.runpod -t <you>/freefield-worker .   (from the repo root)
+#   docker push <you>/freefield-worker
+#
+# or let RunPod build it from a GitHub repo of yours: Dockerfile Path Dockerfile.runpod (a new GitHub release rebuilds it).
+# It holds what infra/modal_app.py's image holds: ComfyUI at the pinned commit, every custom node the packs pin, and
+# comfy-api-proxy. No model weights: those live on the endpoint's network volume, under /runpod-volume/models.
+FROM python:3.12-slim-bookworm
+
+# torch 2.14.1 is the one Modal's image resolved during the lab runs (20 to 26 Oct). Its CUDA 13.0 needs NVIDIA
+# driver 580 or newer, so the endpoint should allow only CUDA 13.0 and up. A CPU build, to try the worker on a machine
+# without a GPU (with FREEFIELD_COMFY_ARGS=--cpu):  --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+ARG TORCH_INDEX_URL=https://pypi.org/simple
+ARG TORCH="torch==2.14.1 torchvision==0.29.1"
+
+ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_ROOT_USER_ACTION=ignore
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ffmpeg libgl1 libglib2.0-0 \
+ && rm -rf /var/lib/apt/lists/*
+RUN pip install --index-url "$TORCH_INDEX_URL" $TORCH
+
+# ComfyUI, the custom nodes and comfy-api-proxy, by the script that sets up your own GPU (it reads the pins from
+# infra/common.py and packs/)
+COPY infra/common.py /freefield/infra/common.py
+COPY packs /freefield/packs
+COPY tools/local_backend.py /freefield/tools/local_backend.py
+RUN python /freefield/tools/local_backend.py setup /comfyui --models /runpod-volume/models
+
+# code last, so editing it does not rebuild the layers above
+COPY infra /freefield/infra
+ENV PORT=80 PORT_HEALTH=80
+EXPOSE 80
+CMD ["python", "/freefield/infra/runpod_worker.py"]

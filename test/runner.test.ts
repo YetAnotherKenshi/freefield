@@ -213,6 +213,33 @@ test("prepare: a backend without the gateway (404) is skipped, auth errors are n
   await assert.rejects(denied.prepare(byId("z-image")), /answered 401/);
 });
 
+test("prepare waits out a cold start: RunPod's 'no workers available' and a proxy's 503 are asked again", async () => {
+  const answers = [
+    new Response(JSON.stringify({ error: "no workers available" }), { status: 400 }),
+    new Response("upstream not ready", { status: 503 }),
+    new Response(JSON.stringify({ freed: false }), { status: 200 }),
+  ];
+  let calls = 0;
+  const flaky = (async () => answers[calls++]) as unknown as typeof fetch;
+  const r = new Runner({ baseUrl: "http://backend.test", token: "t", fetch: flaky, retryDelayMs: 1 });
+  assert.deepEqual(await r.prepare(byId("z-image")), { freed: false });
+  assert.equal(calls, 3);
+  const cold = new Runner({ baseUrl: "http://backend.test", fetch: fakeFetch(() => 503), coldStartMs: 30, retryDelayMs: 5 });
+  await assert.rejects(cold.prepare(byId("z-image")), /answered 503/, "and gives up when the cold start takes too long");
+});
+
+test("health sends the token: RunPod's endpoint wants its API key on every request", async () => {
+  let auth: string | null = null;
+  const capture = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+    auth = new Headers(init?.headers).get("authorization");
+    return new Response("{}", { status: 200 });
+  }) as typeof fetch;
+  await new Runner({ baseUrl: "https://ep1.api.runpod.ai", token: "rpa_key", fetch: capture }).health();
+  assert.equal(auth, "Bearer rpa_key");
+  const down = new Runner({ baseUrl: "http://backend.test", fetch: fakeFetch(() => 401) });
+  await assert.rejects(down.health(), /answered 401/);
+});
+
 test("drafts run only when allowed", async () => {
   // every app is ready now, so the test marks a copy of one as a draft
   const draft = { ...byId("reshoot"), status: "draft" as const };

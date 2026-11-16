@@ -46,7 +46,8 @@ const outDir = process.env.FREEFIELD_OUT || join(root, "out");
 const guard = Guard.fromEnv(join(outDir, "limits.json"));
 const maxUploadMb = Number(process.env.FREEFIELD_MAX_UPLOAD_MB || (guard.hosted ? 100 : 0));
 
-// the backend scales to zero 10 minutes after its last request (infra/modal_app.py scaledown_window).
+// the backend scales to zero 10 minutes after its last request (infra/modal_app.py scaledown_window; on RunPod
+// Serverless, the endpoint's idle timeout of 600 s that the README asks for).
 // lastContact only moves on real work (a run, a wake): status checks must not keep the GPU alive.
 const WARM_MS = 9 * 60 * 1000;
 let lastContact = 0;
@@ -233,9 +234,8 @@ function wake() {
   const r = getRunner();   // throws without COMFY_BASE_URL: the caller answers 400
   waking = { since: Date.now() };
   const started = waking;
-  fetch(`${r.baseUrl}/health`, { signal: AbortSignal.timeout(15 * 60 * 1000) })
-    .then((res) => {
-      if (!res.ok) throw new Error(`/health answered ${res.status}`);
+  r.health()
+    .then(() => {
       contact();
       if (waking === started) waking = null;
     })
