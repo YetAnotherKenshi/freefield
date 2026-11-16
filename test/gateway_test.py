@@ -107,5 +107,19 @@ async def warm():
         await gw.cleanup()
     print("gateway model cache ok")
 
+def copy_parts():
+    """copy_file in several ranges gives the same bytes, for sizes that do not divide evenly and for an empty file."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        src, dst = Path(tmp, "src.safetensors"), Path(tmp, "out", "dst.safetensors")
+        for size in (1_000_013, 0, 7):
+            data = os.urandom(size)
+            src.write_bytes(data)
+            gateway.copy_file(src, dst, parts=4, min_part=100_000)
+            assert dst.read_bytes() == data, size
+            assert not dst.with_name(dst.name + ".part").exists()
+    print("gateway copy in parts ok")
+
 asyncio.run(main())
 asyncio.run(warm())
+copy_parts()

@@ -11,8 +11,8 @@
   app's `files` from the source volume to the cache on the worker's local disk and answers
   202 until they are there; ComfyUI looks in the cache first. RunPod's global volume is
   object storage: ComfyUI's mmap reads it at ~28 MB/s (a 1.5 GB VAE took 52 s, the first
-  LTX-2.5 run spent 5 min on the 15 GB text encoder alone, 16 Nov), while one large
-  sequential read per file is what object storage is fast at.
+  LTX-2.5 run spent 5 min on the 15 GB text encoder alone, 16 Nov), while large sequential
+  reads, several at once, are what object storage is fast at (copy_file).
 - GET /freefield/status shows the current app and ComfyUI's device stats.
 - GET /health is open, for Modal's startup probe.
 - GET /ping is open too, for load balancers that route only to ready workers (RunPod
@@ -32,8 +32,8 @@ import asyncio
 import hmac
 import logging
 import os
-import shutil
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from aiohttp import ClientSession, ClientTimeout, web
@@ -74,13 +74,40 @@ class Pantry:
             return {"freed": freed, "previous": previous, "current": app}
 
 
-def copy_file(src: Path, dst: Path) -> None:
-    """One sequential read in large blocks, into a .part file renamed when complete, so ComfyUI
-    (which skips the .part extension) never sees half a model."""
+def copy_range(fi: int, fo: int, start: int, end: int, block: int = 16 << 20) -> None:
+    """Bytes start..end of one open file into another, as one sequential stream."""
+    off = start
+    while off < end:
+        data = os.pread(fi, min(block, end - off), off)
+        if not data:
+            raise EOFError(f"the source ended at byte {off}, before {end}")
+        view, done = memoryview(data), 0
+        while done < len(data):
+            done += os.pwrite(fo, view[done:], off + done)
+        off += len(data)
+
+
+def copy_file(src: Path, dst: Path, parts: int = 8, min_part: int = 1 << 30) -> None:
+    """src to dst in up to `parts` contiguous ranges read at once, into a .part file renamed when complete, so
+    ComfyUI (which skips the .part extension) never sees half a model. RunPod's global volume serves one read
+    stream at ~120 MB/s and several together at a few times that: from a CPU Pod on 16 Nov, one stream 123 MB/s,
+    16 ranges of one file 229 MB/s, four files at once 301 MB/s in all."""
     dst.parent.mkdir(parents=True, exist_ok=True)
     part = dst.with_name(dst.name + ".part")
-    with open(src, "rb") as f, open(part, "wb") as g:
-        shutil.copyfileobj(f, g, 64 << 20)
+    size = src.stat().st_size
+    step = max(1, -(-size // max(1, min(parts, -(-size // min_part)))))
+    fi = os.open(src, os.O_RDONLY)
+    try:
+        fo = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        try:
+            os.ftruncate(fo, size)
+            starts = range(0, size, step)
+            with ThreadPoolExecutor(max(1, len(starts))) as pool:
+                list(pool.map(lambda s: copy_range(fi, fo, s, min(s + step, size)), starts))
+        finally:
+            os.close(fo)
+    finally:
+        os.close(fi)
     os.replace(part, dst)
 
 
@@ -108,7 +135,8 @@ class Warmer:
                 and not (self.cache / rel).is_file() and (self.source / rel).is_file()]
 
     def start(self, files: list[str]) -> None:
-        for rel in files:
+        """Largest first: the run waits for the last file, and the largest takes longest."""
+        for rel in sorted(files, key=lambda r: -(self.source / r).stat().st_size):
             if rel not in self.tasks or self.tasks[rel].done():
                 self.tasks[rel] = asyncio.get_running_loop().create_task(self._copy(rel))
 
