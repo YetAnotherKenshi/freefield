@@ -315,9 +315,9 @@ The models live on a volume the worker mounts at `/runpod-volume`, in `models/<d
   download to the Pod's own disk and copy the finished files over (Hugging Face's downloader needs file locks it does
   not have). ComfyUI's mmap reads it at about 28 MB/s, so the worker copies each app's model files to its local disk
   on the app's first run there, several large sequential reads at once, and ComfyUI loads them from that disk
-  (`FREEFIELD_MODEL_CACHE`, `infra/gateway.py`). Measured from a CPU Pod on 16 Nov: one read stream 123 MB/s, four
-  at once 301 MB/s in all, so the ~40 GB of `video-t2v` takes 2 to 3 minutes. Give the endpoint a container disk with
-  room for the apps you run.
+  (`FREEFIELD_MODEL_CACHE`, `infra/gateway.py`). On a GPU worker on 16 Nov, one read stream per file still gave
+  177 to 278 MB/s per file, and the 45 GB of `video-t2v` (6 files) copied in 78 s; a CPU Pod reads slower (123 MB/s
+  for one stream, 301 MB/s for four at once). Give the endpoint a container disk with room for the apps you run.
 - A **network volume** ($0.07/GB/month) is a real file system, but only GPUs in its data center can mount it.
 
 Then make the endpoint (**New Endpoint**, type **Load Balancer**) from the image, with:
@@ -363,7 +363,8 @@ two fixes since: a C compiler in the image for Triton, and the model cache (that
 text encoder through mmap). After those, the first `video-t2v` run on a fresh worker still took about 15 minutes and
 the next ones about one: the endpoint had FlashBoot off, so every worker that went idle started over, and the web
 app's server had been started before the cache was added, so it never asked for it (restart `npm run serve` after
-pulling).
+pulling). With both fixed, the first `video-t2v` run on a worker took about 3 min 15 s: 78 s to copy the models, then
+108.5 s for the run itself, loading from the worker's disk.
 
 ### The web app
 
