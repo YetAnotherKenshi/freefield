@@ -228,6 +228,23 @@ test("prepare waits out a cold start: RunPod's 'no workers available' and a prox
   await assert.rejects(cold.prepare(byId("z-image")), /answered 503/, "and gives up when the cold start takes too long");
 });
 
+test("prepare names every model file and waits while the worker copies them to its disk (202)", async () => {
+  const bodies: { files?: string[] }[] = [];
+  let calls = 0;
+  const warming = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+    bodies.push(JSON.parse(String(init?.body)));
+    return ++calls < 3
+      ? new Response(JSON.stringify({ warming: true, pending: 2, pending_gb: 20.1 }), { status: 202 })
+      : new Response(JSON.stringify({ freed: false }), { status: 200 });
+  }) as typeof fetch;
+  const app = byId("transitions");
+  const r = new Runner({ baseUrl: "http://backend.test", fetch: warming, retryDelayMs: 1 });
+  assert.deepEqual(await r.prepare(app), { freed: false });
+  assert.equal(calls, 3);
+  assert.ok(bodies[0].files?.some((f) => f.startsWith("loras/")), "loras are cached too, though the unload key leaves them out");
+  assert.equal(new Set(bodies[0].files).size, bodies[0].files?.length);
+});
+
 test("health sends the token: RunPod's endpoint wants its API key on every request", async () => {
   let auth: string | null = null;
   const capture = (async (_url: RequestInfo | URL, init?: RequestInit) => {

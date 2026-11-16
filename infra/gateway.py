@@ -4,9 +4,15 @@
 
 - Every request needs `Authorization: Bearer $FREEFIELD_TOKEN` (the Comfy SDK sends its
   apiKey that way). The header is stripped before forwarding; the proxy has no auth.
-- POST /freefield/prepare {"app", "models"} is the pantry manager: when the requested
+- POST /freefield/prepare {"app", "models", "files"} is the pantry manager: when the requested
   app needs a different set of models than the one that ran last, it asks ComfyUI to
   unload everything (POST /free) so nothing from the previous app stays in VRAM.
+  With FREEFIELD_MODEL_SOURCE and FREEFIELD_MODEL_CACHE set (RunPod), it first copies the
+  app's `files` from the source volume to the cache on the worker's local disk and answers
+  202 until they are there; ComfyUI looks in the cache first. RunPod's global volume is
+  object storage: ComfyUI's mmap reads it at ~28 MB/s (a 1.5 GB VAE took 52 s, the first
+  LTX-2.5 run spent 5 min on the 15 GB text encoder alone, 16 Nov), while one large
+  sequential read per file is what object storage is fast at.
 - GET /freefield/status shows the current app and ComfyUI's device stats.
 - GET /health is open, for Modal's startup probe.
 - GET /ping is open too, for load balancers that route only to ready workers (RunPod
@@ -17,7 +23,8 @@
   rewritten to the address the client reached the gateway on, or to FREEFIELD_PUBLIC_URL
   when that is set (behind a load balancer whose Host header is not the public one).
 
-Run: python gateway.py  (env: FREEFIELD_TOKEN, COMFYUI_URL, PROXY_URL, GATEWAY_PORT, FREEFIELD_PUBLIC_URL)
+Run: python gateway.py  (env: FREEFIELD_TOKEN, COMFYUI_URL, PROXY_URL, GATEWAY_PORT, FREEFIELD_PUBLIC_URL,
+FREEFIELD_MODEL_SOURCE, FREEFIELD_MODEL_CACHE)
 """
 from __future__ import annotations
 
@@ -25,7 +32,9 @@ import asyncio
 import hmac
 import logging
 import os
+import shutil
 import time
+from pathlib import Path
 
 from aiohttp import ClientSession, ClientTimeout, web
 
@@ -34,6 +43,8 @@ PROXY_URL = os.environ.get("PROXY_URL", "http://127.0.0.1:8189")
 TOKEN = os.environ.get("FREEFIELD_TOKEN", "")
 ALLOW_OPEN = os.environ.get("FREEFIELD_ALLOW_OPEN") == "1"
 PUBLIC_URL = os.environ.get("FREEFIELD_PUBLIC_URL", "").strip().rstrip("/")
+MODEL_SOURCE = os.environ.get("FREEFIELD_MODEL_SOURCE", "")
+MODEL_CACHE = os.environ.get("FREEFIELD_MODEL_CACHE", "")
 OPEN_PATHS = {"/health", "/ping"}
 HOP_HEADERS = {"host", "authorization", "content-length", "transfer-encoding", "connection", "keep-alive"}
 
@@ -61,6 +72,58 @@ class Pantry:
                 self.frees += 1
             self.models, self.app = models, app
             return {"freed": freed, "previous": previous, "current": app}
+
+
+def copy_file(src: Path, dst: Path) -> None:
+    """One sequential read in large blocks, into a .part file renamed when complete, so ComfyUI
+    (which skips the .part extension) never sees half a model."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    part = dst.with_name(dst.name + ".part")
+    with open(src, "rb") as f, open(part, "wb") as g:
+        shutil.copyfileobj(f, g, 64 << 20)
+    os.replace(part, dst)
+
+
+class Warmer:
+    """Copies model files from a slow source volume to a local cache, a few at a time, each once."""
+
+    def __init__(self, source: str, cache: str, parallel: int = 4):
+        self.source, self.cache = Path(source), Path(cache)
+        self.tasks: dict[str, asyncio.Task] = {}
+        self.failed: dict[str, str] = {}
+        self.sem = asyncio.Semaphore(parallel)
+
+    @staticmethod
+    def safe(rel: object) -> bool:
+        """`dir/name` and nothing else: the list comes from the client."""
+        if not isinstance(rel, str):
+            return False
+        parts = Path(rel).parts
+        return len(parts) == 2 and not Path(rel).is_absolute() and ".." not in parts
+
+    def pending(self, files: list) -> list[str]:
+        """Files the source has and the cache does not, minus those that failed to copy (ComfyUI
+        reads those from the source)."""
+        return [rel for rel in dict.fromkeys(files) if self.safe(rel) and rel not in self.failed
+                and not (self.cache / rel).is_file() and (self.source / rel).is_file()]
+
+    def start(self, files: list[str]) -> None:
+        for rel in files:
+            if rel not in self.tasks or self.tasks[rel].done():
+                self.tasks[rel] = asyncio.get_running_loop().create_task(self._copy(rel))
+
+    async def _copy(self, rel: str) -> None:
+        async with self.sem:
+            src = self.source / rel
+            t0 = time.time()
+            try:
+                await asyncio.to_thread(copy_file, src, self.cache / rel)
+            except Exception as e:  # a full disk, a vanished file: ComfyUI falls back to the source
+                self.failed[rel] = f"{type(e).__name__}: {e}"
+                log.warning("cache %s failed: %s", rel, self.failed[rel])
+                return
+            gb, s = src.stat().st_size / 1e9, max(time.time() - t0, 1e-3)
+            log.info("cached %s: %.2f GB in %.0f s (%.0f MB/s)", rel, gb, s, gb * 1000 / s)
 
 
 def authorized(request: web.Request) -> bool:
@@ -102,6 +165,14 @@ async def prepare(request: web.Request) -> web.Response:
     body = await request.json()
     if not isinstance(body.get("models"), str) or not isinstance(body.get("app"), str):
         return web.json_response({"error": "expected {app, models}"}, status=400)
+    warmer: Warmer | None = request.app["warmer"]
+    if warmer is not None and isinstance(body.get("files"), list):
+        pending = warmer.pending(body["files"])
+        if pending:   # the client asks again until this is empty
+            warmer.start(pending)
+            gb = sum((warmer.source / rel).stat().st_size for rel in pending) / 1e9
+            return web.json_response({"warming": True, "pending": len(pending), "pending_gb": round(gb, 1)},
+                                     status=202)
     result = await request.app["pantry"].prepare(body["app"], body["models"])
     log.info("prepare %s → %s", body["app"], result)
     return web.json_response(result)
@@ -171,6 +242,7 @@ async def forward(request: web.Request) -> web.StreamResponse:
 async def on_startup(app: web.Application) -> None:
     app["session"] = ClientSession(timeout=ClientTimeout(total=None, sock_connect=30), auto_decompress=False)
     app["pantry"] = Pantry(app["session"])
+    app["warmer"] = Warmer(MODEL_SOURCE, MODEL_CACHE) if MODEL_SOURCE and MODEL_CACHE else None
 
 
 async def on_cleanup(app: web.Application) -> None:

@@ -77,4 +77,35 @@ async def main():
     print("gateway relink and ping ok")
     await gw.cleanup()
 
+
+async def warm():
+    """With a model source and cache, prepare copies the app's files first and answers 202 until they are there."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        src, cache = Path(tmp, "volume"), Path(tmp, "cache")
+        (src / "vae").mkdir(parents=True)
+        (src / "vae" / "a.safetensors").write_bytes(b"x" * 1_000_000)
+        gateway.MODEL_SOURCE, gateway.MODEL_CACHE = str(src), str(cache)
+        gw = web.AppRunner(gateway.make_app()); await gw.setup(); await web.TCPSite(gw, "127.0.0.1", 18001).start()
+        body = {"app": "x", "models": "vae/a.safetensors",
+                "files": ["vae/a.safetensors", "../../etc/passwd", "/etc/passwd", "loras/not-on-the-volume.safetensors"]}
+        h = {"Authorization": "Bearer t0k"}
+        async with ClientSession() as s:
+            async with s.post("http://127.0.0.1:18001/freefield/prepare", json=body, headers=h) as r:
+                first = await r.json()
+                assert r.status == 202 and first["pending"] == 1, (r.status, first)
+            for _ in range(50):
+                async with s.post("http://127.0.0.1:18001/freefield/prepare", json=body, headers=h) as r:
+                    if r.status == 200:
+                        break
+                await asyncio.sleep(0.1)
+            assert r.status == 200, r.status
+        assert (cache / "vae" / "a.safetensors").read_bytes() == b"x" * 1_000_000
+        assert not list(cache.rglob("*.part")), "the .part file is renamed when the copy is complete"
+        assert not (cache / "etc").exists() and not Path(tmp, "etc").exists(), "only dir/name paths are copied"
+        gateway.MODEL_SOURCE = gateway.MODEL_CACHE = ""
+        await gw.cleanup()
+    print("gateway model cache ok")
+
 asyncio.run(main())
+asyncio.run(warm())

@@ -1,5 +1,6 @@
 // The waiter: turns form values into a filled workflow using only what app.json says,
 // asks the gateway to clear the GPU when the app's models change, and submits with the Comfy SDK.
+import { basename } from "node:path";
 import { Comfy } from "@comfyorg/sdk";
 import type { App, Input } from "./registry.ts";
 import { isFileInput, modelKey } from "./registry.ts";
@@ -269,16 +270,34 @@ export class Runner {
    * Freefield gateway (a bare comfy-api-proxy, a hosted Comfy API) answers 404 and manages
    * its own memory, so that is not an error. It is the first request of every run, so it is the one that waits
    * out a cold start; the job's own requests then find the backend up.
+   *
+   * `files` lists every model file of the app. A RunPod worker copies those from its volume to its local disk
+   * first and answers 202 while it does (infra/gateway.py, Warmer); the same request is sent again until it is done.
    */
   async prepare(app: App): Promise<{ freed: boolean; skipped?: boolean }> {
-    const res = await this.fetchThroughColdStart(`${this.baseUrl}/freefield/prepare`, {
+    const files = [...new Set(app.models.map((m) => `${m.dir}/${basename(m.file)}`))];
+    const init = {
       method: "POST",
       headers: { "content-type": "application/json", ...this.auth() },
-      body: JSON.stringify({ app: app.id, models: modelKey(app) }),
-    });
-    if (res.status === 404 || res.status === 405) return { freed: false, skipped: true };
-    if (!res.ok) throw new Error(`gateway /freefield/prepare answered ${res.status}`);
-    return (await res.json()) as { freed: boolean };
+      body: JSON.stringify({ app: app.id, models: modelKey(app), files }),
+    };
+    const deadline = Date.now() + this.coldStartMs;
+    let told = false;
+    for (;;) {
+      const res = await this.fetchThroughColdStart(`${this.baseUrl}/freefield/prepare`, init);
+      if (res.status === 404 || res.status === 405) return { freed: false, skipped: true };
+      if (!res.ok) throw new Error(`gateway /freefield/prepare answered ${res.status}`);
+      if (res.status !== 202) return (await res.json()) as { freed: boolean };
+      const warming = (await res.json().catch(() => ({}))) as { pending?: number; pending_gb?: number };
+      if (Date.now() + this.retryDelayMs >= deadline) {
+        throw new Error(`the backend was still copying ${warming.pending ?? "?"} model files to its disk after ${Math.round(this.coldStartMs / 60_000)} min`);
+      }
+      if (!told) {
+        console.error(`the backend is copying ${warming.pending ?? "?"} model files (${warming.pending_gb ?? "?"} GB) for ${app.id} to its local disk; waiting`);
+        told = true;
+      }
+      await new Promise((r) => setTimeout(r, this.retryDelayMs));
+    }
   }
 
   async submit(app: App, rawValues: Values, presetId?: string) {

@@ -305,22 +305,31 @@ https for any public address; an SSH tunnel does (`ssh -L 8000:127.0.0.1:8000 â€
 docker build --platform linux/amd64 -f Dockerfile.runpod -t <you>/freefield-worker .
 docker push <you>/freefield-worker
 
-# 2. the models, onto a network volume, from any Pod (a CPU one is enough) with the volume attached and HF_TOKEN set
-cd /workspace && pip install "huggingface_hub[hf-xet]" && git clone https://github.com/neuregex/freefield.git
-python freefield/tools/local_backend.py download /workspace/comfy image-flux3 video-ltx25 --models /workspace/models
+# 2. the models, onto a volume, from a Pod with the volume attached and HF_TOKEN set
+python tools/local_backend.py download /root/comfy video-ltx25 upscale --models /root/models   # then copy to <volume>/models
 ```
 
-A Pod mounts the volume at `/workspace` and a worker at `/runpod-volume`, so the worker finds the models in
-`/runpod-volume/models`. Then make the endpoint (**New Endpoint**, type **Load Balancer**) from the image, with:
+The models live on a volume the worker mounts at `/runpod-volume`, in `models/<dir>/`. Two kinds:
+
+- A **global volume** is not tied to a data center, so workers start wherever a GPU is free. It is object storage:
+  download to the Pod's own disk and copy the finished files over (Hugging Face's downloader needs file locks it does
+  not have). ComfyUI's mmap reads it at about 28 MB/s, so the worker copies each app's model files to its local disk
+  on the app's first run there, with one sequential read per file, and ComfyUI loads them from that disk
+  (`FREEFIELD_MODEL_CACHE`, `infra/gateway.py`). Give the endpoint a container disk with room for the apps you run.
+- A **network volume** ($0.07/GB/month) is a real file system, but only GPUs in its data center can mount it.
+
+Then make the endpoint (**New Endpoint**, type **Load Balancer**) from the image, with:
 
 | Setting | Value | Why |
 |---|---|---|
-| GPU | 48 GB (L40S, A6000, RTX 6000 Ada) for the apps marked *needs Modal*, 24 GB for the rest | the [app table](#apps) |
+| GPU | pools `ADA_48_PRO` and `AMPERE_48` (L40S, RTX 6000 Ada, L40, A40, A6000) | 48 GB: the [app table](#apps) |
 | CUDA versions | 13.0 and up | the image's torch 2.14.1 is built for CUDA 13.0 |
-| Max workers | 1 | the jobs live in one ComfyUI, as `max_containers=1` does on Modal |
+| Max workers | 1, or 2 so a worker whose machine is busy (THROTTLED) does not hold the run | the jobs live in one ComfyUI, as `max_containers=1` does on Modal |
+| Request count | 32 | the second worker is a spare for capacity, not for load |
 | Active workers | 0 | scales to zero |
-| Idle timeout | 600 s | the web app counts on 10 warm minutes after a run, as on Modal; less is cheaper |
-| Network volume | the one with the models | |
+| Idle timeout | 180 s | after a run, the worker waits this long for the next one; billed |
+| Container disk | 100 GB | the model cache (an LTX-2.5 run reads about 45 GB of models) |
+| Volume | the one with the models | |
 | `PORT`, `PORT_HEALTH` | leave both at 80 | the gateway answers RunPod's `/ping` health check on its own port |
 
 In `.env`:
@@ -344,11 +353,11 @@ about them:
 - When links in job answers come out wrong (`fetch failed` after the submit), set `FREEFIELD_PUBLIC_URL` to the
   endpoint URL in the endpoint's environment. The worker sets it from `RUNPOD_ENDPOINT_ID` when RunPod provides that.
 
-Checked on 16 Nov without a RunPod account, on a Mac: `infra/runpod_worker.py` over a CPU ComfyUI installed the way
-the image installs it (torch 2.14.1, then `local_backend.py setup`) answered `/ping` with 204 while ComfyUI booted
-and 200 after, ran the model-free `smoke` app from `npm run app` with a made-up RunPod key as the token, woke from the
-GPU pill, and stopped all three processes on SIGTERM. The image itself was not built here, and nothing has run on
-RunPod yet.
+Run on RunPod on 16 Nov (RTX PRO 6000 Blackwell MIG 48 GB, global volume): the image built from GitHub in 7 min, a
+worker answered `/ping` with 204 for the 10 s ComfyUI took to boot and 200 after, `smoke` ran from `npm run app` in
+85.6 s counting the wait for a GPU, and links and the RunPod key worked as above. The first `video-t2v` run showed the
+two fixes since: a C compiler in the image for Triton, and the model cache (that run spent over 5 min reading the
+text encoder through mmap).
 
 ### The web app
 
