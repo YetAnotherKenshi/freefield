@@ -2,6 +2,7 @@ node_modules/
 out/
 .env
 .env.local
+.env.modal
 .modal.toml
 lab/results/
 lab/assets/*.mp4

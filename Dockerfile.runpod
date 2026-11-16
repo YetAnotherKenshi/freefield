@@ -16,8 +16,11 @@ ARG TORCH="torch==2.14.1 torchvision==0.29.1"
 
 ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_ROOT_USER_ACTION=ignore
 
+# gcc and libc6-dev: Triton compiles its CUDA launcher with the system C compiler the first time it runs a kernel,
+# and torch 2.14 sends some ops to Triton kernels (LTX-2.5's Gemma text encoder failed in CLIPTextEncode without
+# one: "Failed to find C compiler", RunPod, 16 Nov)
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git ffmpeg libgl1 libglib2.0-0 \
+ && apt-get install -y --no-install-recommends git ffmpeg libgl1 libglib2.0-0 gcc libc6-dev \
  && rm -rf /var/lib/apt/lists/*
 RUN pip install --index-url "$TORCH_INDEX_URL" $TORCH
 
