@@ -423,6 +423,19 @@ The link sets the passcode as a cookie; without it every page and API call gets 
 there, uploads stop at 100 MB, and the history lives in the `freefield-web` volume. Running `setup_demo.py` again
 changes the passcode and locks out the old link once you redeploy.
 
+The same goes on a server of your own: `Dockerfile` builds the web app alone (it sends the runs to `COMFY_BASE_URL`,
+so a small VPS without a GPU does), and the history lives in `/data` inside the container.
+
+```sh
+docker build -t freefield-web .
+docker run -d --name freefield --restart unless-stopped --env-file .env.server \
+  -v freefield-out:/data -p 127.0.0.1:3000:3000 freefield-web
+```
+
+`.env.server` holds `COMFY_BASE_URL`, `FREEFIELD_TOKEN`, `FREEFIELD_PASSCODE` (and `FREEFIELD_MAX_UPLOAD_MB=28` for
+RunPod). Put an HTTPS proxy in front (Caddy: `caddy reverse-proxy --from <your host> --to 127.0.0.1:3000`): the
+passcode cookie is `Secure`, so the browser keeps it only over HTTPS.
+
 Any ComfyUI works as the backend: run `comfy-api-proxy` next to it and `python infra/gateway.py` in front, and point
 `COMFY_BASE_URL` at the gateway. Pointing it straight at a `comfy-api-proxy` (or another Comfy API v2 endpoint) works
 too; only the unload-between-apps step is skipped. An app marked `draft` (none is, today) stays locked in the UI and

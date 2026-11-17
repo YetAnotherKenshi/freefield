@@ -1,0 +1,10 @@
+# For Dockerfile (the web studio); Dockerfile.runpod uses .dockerignore. Only what the web server reads.
+*
+!package.json
+!package-lock.json
+!schema/
+!apps/
+!server/
+!docs/vram-map.json
+!lab/flags.json
+!web/
