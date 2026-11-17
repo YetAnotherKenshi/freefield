@@ -1,0 +1,6 @@
+# Dockerfile.runpod copies only these (BuildKit reads <Dockerfile>.dockerignore); the web UI, apps and media stay out
+*
+!infra/
+!packs/
+!tools/local_backend.py
+**/__pycache__

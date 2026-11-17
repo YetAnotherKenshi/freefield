@@ -1,6 +1,0 @@
-# Dockerfile.runpod copies only these; the web UI, the apps and the media stay out of the build context
-*
-!infra/
-!packs/
-!tools/local_backend.py
-**/__pycache__

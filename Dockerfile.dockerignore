@@ -1,4 +1,4 @@
-# For Dockerfile (the web studio); Dockerfile.runpod uses .dockerignore. Only what the web server reads.
+# For Dockerfile (the web studio), with BuildKit; Dockerfile.runpod has its own. Without BuildKit nothing is ignored, which builds too.
 *
 !package.json
 !package-lock.json
